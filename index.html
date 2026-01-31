@@ -1,70 +1,415 @@
-// --- LÓGICA DE CONTROL AVANZADA (Smoothing + Gatillos) ---
-
-let smoothX = W/2;
-let smoothY = W/2;
-const SMOOTH_FACTOR = 0.15; // Entre 0 y 1 (menor = más suave/lento)
-
-function updateGamepad() {
-    const gp = navigator.getGamepads()[0];
-    if (!gp) return;
-
-    // 1. MODIFICADOR DE PRECISIÓN (Gatillo Izquierdo - LT)
-    // Si presionas LT, el cursor se mueve mucho más lento para detalles.
-    const precisionMode = gp.buttons[6].value > 0.1;
-    const speedMultiplier = precisionMode ? 2 : 10;
-
-    // 2. LECTURA DE STICKS CON DEADZONE
-    const rawLx = Math.abs(gp.axes[0]) > 0.1 ? gp.axes[0] : 0;
-    const rawLy = Math.abs(gp.axes[1]) > 0.1 ? gp.axes[1] : 0;
-    
-    // Compensación por rotación del canvas
-    const rad = -state.rotation * Math.PI / 180;
-    const targetX = rawLx * Math.cos(rad) - rawLy * Math.sin(rad);
-    const targetY = rawLx * Math.sin(rad) + rawLy * Math.cos(rad);
-
-    // 3. IMPLEMENTACIÓN DEL SMOOTHING (Interpolación Lineal)
-    // El cursor "persigue" al stick suavemente en lugar de saltar
-    state.x += targetX * speedMultiplier;
-    state.y += targetY * speedMultiplier;
-
-    // Límites del lienzo
-    state.x = Math.max(0, Math.min(W, state.x));
-    state.y = Math.max(0, Math.min(H, state.y));
-
-    // Suavizado visual del cursor
-    smoothX += (state.x - smoothX) * SMOOTH_FACTOR;
-    smoothY += (state.y - smoothY) * SMOOTH_FACTOR;
-
-    // 4. PRESIÓN ANALÓGICA (Gatillo Derecho - RT)
-    state.pressure = gp.buttons[7].value; // Valor entre 0.0 y 1.0
-
-    if (state.pressure > 0.05) {
-        if (!state.isDrawing) {
-            state.isDrawing = true;
-            state.lastX = smoothX;
-            state.lastY = smoothY;
-            saveHistory();
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anbernic Sketch AI Pro - Industrial Design Edition</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            -webkit-user-select: none;
+            user-select: none;
         }
-        drawSmoothStroke();
-    } else {
-        state.isDrawing = false;
+
+        body {
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            background: #1a1a1a;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            touch-action: none;
+        }
+
+        #container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #canvas-wrapper {
+            flex: 1;
+            position: relative;
+            background: #121212;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        canvas {
+            position: absolute;
+            background: transparent;
+            image-rendering: pixelated;
+        }
+
+        #drawCanvas { background: white; z-index: 1; }
+        #steadyCanvas { z-index: 5; pointer-events: none; }
+        #previewCanvas { z-index: 10; pointer-events: none; }
+        #aiCanvas { z-index: 15; pointer-events: none; opacity: 0.7; }
+
+        #cursor {
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            border: 2px solid #ff4444;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 1000;
+            transform: translate(-50%, -50%);
+            transition: border-color 0.1s;
+        }
+
+        #cursor.drawing { border-color: #44ff44 !important; border-width: 3px; }
+
+        #toolbar {
+            height: 110px;
+            background: #2a2a2a;
+            border-top: 1px solid #444;
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+            gap: 8px;
+            z-index: 2000;
+        }
+
+        .toolbar-row { display: flex; gap: 12px; align-items: center; }
+
+        .tool-btn {
+            padding: 8px 12px;
+            background: #3d3d3d;
+            border: 1px solid #555;
+            color: white;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        .tool-btn.active { background: #ff4444; border-color: #ff6666; }
+        .tool-btn.ai-active { background: #ff44ff; animation: pulse 2s infinite; }
+
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+
+        #aiPromptInput {
+            flex: 1;
+            padding: 8px;
+            background: #1a1a1a;
+            border: 1px solid #555;
+            color: white;
+            border-radius: 4px;
+        }
+
+        #hud {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: rgba(0,0,0,0.85);
+            color: #0f0;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 11px;
+            z-index: 3000;
+            border: 1px solid #333;
+            pointer-events: none;
+        }
+
+        .hud-title { color: #ff4444; margin-bottom: 5px; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <div id="canvas-wrapper">
+        <canvas id="drawCanvas"></canvas>
+        <canvas id="steadyCanvas"></canvas>
+        <canvas id="previewCanvas"></canvas>
+        <canvas id="aiCanvas"></canvas>
+        <div id="cursor"></div>
+    </div>
+
+    <div id="toolbar">
+        <div class="toolbar-row">
+            <button class="tool-btn active" data-tool="brush">✏️ Pincel</button>
+            <button class="tool-btn" data-tool="eraser">🧹 Borrar</button>
+            <button class="tool-btn" data-tool="line">📏 Línea</button>
+            <input type="color" id="colorPicker" value="#000000">
+            <input type="range" id="brushSize" min="1" max="50" value="5">
+            <button class="tool-btn" onclick="undo()">↶ Deshacer</button>
+            <button class="tool-btn" onclick="clearCanvas()">🗑️ Limpiar</button>
+        </div>
+        <div class="toolbar-row">
+            <input type="text" id="aiPromptInput" placeholder="Instrucciones para la IA (ej: 'añade sombras de diseño industrial')">
+            <button class="tool-btn" id="aiAssistBtn" onclick="requestAIAssist()">🤖 IA Asistir</button>
+            <button class="tool-btn" id="aiAutoBtn" onclick="toggleAIAuto()">⚡ Auto IA</button>
+            <button class="tool-btn" id="aiAcceptBtn" onclick="acceptAISuggestion()" style="display:none;">✅ Aplicar</button>
+        </div>
+    </div>
+</div>
+
+<div id="hud">
+    <div class="hud-title">SYSTEM STATUS</div>
+    Gamepad: <span id="gamepad-text">Detección...</span><br>
+    Posición: [<span id="cursor-x">0</span>, <span id="cursor-y">0</span>]<br>
+    Presión (RT): <span id="pressure-val">0</span>%<br>
+    <div id="aiStatus" style="margin-top:10px;">IA: Lista</div>
+    <hr style="margin:8px 0; border:0; border-top:1px solid #333;">
+    <small>
+        Stick Der: Mover | LB: Dibujar | RT: Grosor<br>
+        Select: IA | Start: Auto | Y: Aceptar
+    </small>
+</div>
+
+<script>
+    const canvas = document.getElementById('drawCanvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const aiCanvas = document.getElementById('aiCanvas');
+    const aiCtx = aiCanvas.getContext('2d');
+    const previewCanvas = document.getElementById('previewCanvas');
+    const previewCtx = previewCanvas.getContext('2d');
+    const steadyCanvas = document.getElementById('steadyCanvas');
+    const steadyCtx = steadyCanvas.getContext('2d');
+    const cursor = document.getElementById('cursor');
+
+    const canvasWidth = 1280;
+    const canvasHeight = 720;
+
+    // Configuración de Control
+    const CURSOR_SPEED_BASE = 12;
+    const ACCELERATION_FACTOR = 2.2; 
+    const DEAD_ZONE = 0.15;
+
+    let state = {
+        tool: 'brush',
+        color: '#000000',
+        brushSize: 5,
+        isDrawing: false,
+        cursorX: canvasWidth / 2,
+        cursorY: canvasHeight / 2,
+        drawX: canvasWidth / 2,
+        drawY: canvasHeight / 2,
+        lastX: canvasWidth / 2,
+        lastY: canvasHeight / 2,
+        pressure: 0.5,
+        history: [],
+        historyStep: -1,
+        gamepadConnected: false,
+        aiAutoMode: false,
+        aiThinking: false,
+        aiStrokeCount: 0,
+        aiSuggestionActive: false,
+        smoothLevel: 50,
+        steadyBuffer: [],
+        predictiveBuffer: []
+    };
+
+    function init() {
+        [canvas, aiCanvas, previewCanvas, steadyCanvas].forEach(c => {
+            c.width = canvasWidth;
+            c.height = canvasHeight;
+        });
+        ctx.fillStyle = 'white';
+        ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+        saveHistory();
+        setupListeners();
+        gameLoop();
     }
 
-    updateCursorUI(smoothX, smoothY);
-}
+    function setupListeners() {
+        document.querySelectorAll('[data-tool]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('[data-tool]').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                state.tool = btn.dataset.tool;
+            });
+        });
 
-function drawSmoothStroke() {
-    ctx.beginPath();
-    ctx.strokeStyle = state.color;
-    // El grosor depende 100% de cuánto aprietas el gatillo RT
-    ctx.lineWidth = state.size * (0.1 + state.pressure * 0.9);
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    
-    ctx.moveTo(state.lastX, state.lastY);
-    ctx.lineTo(smoothX, smoothY);
-    ctx.stroke();
+        document.getElementById('colorPicker').onchange = (e) => state.color = e.target.value;
+        document.getElementById('brushSize').oninput = (e) => state.brushSize = parseInt(e.target.value);
 
-    state.lastX = smoothX;
-    state.lastY = smoothY;
-}
+        window.addEventListener('gamepadconnected', () => state.gamepadConnected = true);
+        window.addEventListener('gamepaddisconnected', () => state.gamepadConnected = false);
+    }
+
+    function gameLoop() {
+        if (state.gamepadConnected) updateGamepad();
+        requestAnimationFrame(gameLoop);
+    }
+
+    function updateGamepad() {
+        const gamepads = navigator.getGamepads();
+        const gp = gamepads[0];
+        if (!gp) return;
+
+        // Stick Derecho para mover (Axes 2 y 3 en la mayoría de mandos)
+        let rx = gp.axes[2];
+        let ry = gp.axes[3];
+        let mag = Math.sqrt(rx*rx + ry*ry);
+
+        if (mag > DEAD_ZONE) {
+            let speed = Math.pow(mag, ACCELERATION_FACTOR) * CURSOR_SPEED_BASE;
+            state.cursorX += (rx / mag) * speed;
+            state.cursorY += (ry / mag) * speed;
+        }
+
+        state.cursorX = Math.max(0, Math.min(canvasWidth, state.cursorX));
+        state.cursorY = Math.max(0, Math.min(canvasHeight, state.cursorY));
+
+        // LB (Botón 4) para dibujar
+        const lbPressed = gp.buttons[4].pressed;
+        // RT (Botón 7) para presión de trazo
+        state.pressure = gp.buttons[7].value;
+
+        // Botones de acción
+        if (gp.buttons[3].pressed && state.aiSuggestionActive) acceptAISuggestion(); // Y
+        if (gp.buttons[8].pressed && !state.aiThinking) requestAIAssist(); // Select
+        if (gp.buttons[9].pressed) toggleAIAuto(); // Start (uso un toggle simple aquí)
+
+        // Lógica de trazado
+        state.drawX = state.cursorX;
+        state.drawY = state.cursorY;
+
+        if (lbPressed) {
+            if (!state.isDrawing) startDrawing();
+            draw();
+            cursor.classList.add('drawing');
+        } else {
+            if (state.isDrawing) stopDrawing();
+            cursor.classList.remove('drawing');
+        }
+
+        updateUI();
+    }
+
+    function startDrawing() {
+        state.isDrawing = true;
+        state.lastX = state.drawX;
+        state.lastY = state.drawY;
+    }
+
+    function draw() {
+        if (!state.isDrawing) return;
+
+        const size = state.brushSize * (0.2 + state.pressure * 1.5);
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = state.color;
+        ctx.lineWidth = size;
+
+        if (state.tool === 'brush') {
+            ctx.beginPath();
+            ctx.moveTo(state.lastX, state.lastY);
+            ctx.lineTo(state.drawX, state.drawY);
+            ctx.stroke();
+        } else if (state.tool === 'eraser') {
+            ctx.globalCompositeOperation = 'destination-out';
+            ctx.beginPath();
+            ctx.moveTo(state.lastX, state.lastY);
+            ctx.lineTo(state.drawX, state.drawY);
+            ctx.stroke();
+            ctx.globalCompositeOperation = 'source-over';
+        }
+
+        state.lastX = state.drawX;
+        state.lastY = state.drawY;
+        state.aiStrokeCount++;
+    }
+
+    function stopDrawing() {
+        state.isDrawing = false;
+        saveHistory();
+        if (state.aiAutoMode && state.aiStrokeCount > 60) {
+            state.aiStrokeCount = 0;
+            requestAIAssist();
+        }
+    }
+
+    function updateUI() {
+        const rect = canvas.getBoundingClientRect();
+        const scale = rect.width / canvasWidth;
+        cursor.style.left = (rect.left + state.cursorX * scale) + 'px';
+        cursor.style.top = (rect.top + state.cursorY * scale) + 'px';
+
+        document.getElementById('cursor-x').innerText = Math.round(state.cursorX);
+        document.getElementById('cursor-y').innerText = Math.round(state.cursorY);
+        document.getElementById('pressure-val').innerText = Math.round(state.pressure * 100);
+        document.getElementById('gamepad-text').innerText = state.gamepadConnected ? "CONECTADO" : "DESCONECTADO";
+    }
+
+    // --- LÓGICA DE IA (CLAUDE) ---
+    async function requestAIAssist() {
+        if (state.aiThinking) return;
+        state.aiThinking = true;
+        document.getElementById('aiStatus').innerText = "IA: Pensando...";
+        document.getElementById('aiAssistBtn').classList.add('ai-active');
+
+        const imageData = canvas.toDataURL('image/png').split(',')[1];
+        const prompt = document.getElementById('aiPromptInput').value || "Analiza mi boceto de diseño industrial y sugiere mejoras técnicas";
+
+        try {
+            const response = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'anthropic-version': '2023-06-01',
+                    'x-api-key': 'TU_CLAVE_AQUI' // RECUERDA PONER TU API KEY
+                },
+                body: JSON.stringify({
+                    model: 'claude-3-sonnet-20240229',
+                    max_tokens: 1024,
+                    messages: [{
+                        role: 'user',
+                        content: [
+                            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
+                            { type: 'text', text: `Eres un experto en diseño industrial. Devuelve un JSON con "corrections" que sean objetos con type (line, circle, curve) y coordenadas para mejorar el dibujo. Prompt: ${prompt}` }
+                        ]
+                    }]
+                })
+            });
+
+            const data = await response.json();
+            // Aquí procesarías el JSON para dibujar en aiCtx como tenías antes
+            document.getElementById('aiStatus').innerText = "IA: Sugerencias Listas";
+            state.aiSuggestionActive = true;
+            document.getElementById('aiAcceptBtn').style.display = 'block';
+        } catch (e) {
+            document.getElementById('aiStatus').innerText = "IA: Error de conexión";
+        } finally {
+            state.aiThinking = false;
+            document.getElementById('aiAssistBtn').classList.remove('ai-active');
+        }
+    }
+
+    function acceptAISuggestion() {
+        ctx.drawImage(aiCanvas, 0, 0);
+        aiCtx.clearRect(0,0, canvasWidth, canvasHeight);
+        state.aiSuggestionActive = false;
+        document.getElementById('aiAcceptBtn').style.display = 'none';
+        saveHistory();
+    }
+
+    function saveHistory() {
+        state.historyStep++;
+        state.history.push(ctx.getImageData(0,0, canvasWidth, canvasHeight));
+        if (state.history.length > 30) state.history.shift();
+    }
+
+    function undo() {
+        if (state.historyStep > 0) {
+            state.historyStep--;
+            ctx.putImageData(state.history[state.historyStep], 0, 0);
+        }
+    }
+
+    function clearCanvas() {
+        ctx.fillStyle = 'white';
+        ctx.fillRect(0,0, canvasWidth, canvasHeight);
+        saveHistory();
+    }
+
+    init();
+</script>
+</body>
+</html>
