@@ -1,259 +1,70 @@
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Anbernic Sketch Pro - Industrial Edition</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-user-select: none; user-select: none; }
-        body { width: 100vw; height: 100vh; overflow: hidden; background: #1a1a1a; font-family: 'Segoe UI', Arial, sans-serif; touch-action: none; }
-        
-        #container { width: 100%; height: 100%; display: flex; flex-direction: column; }
-        #canvas-wrapper { flex: 1; position: relative; background: #111; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+// --- LÓGICA DE CONTROL AVANZADA (Smoothing + Gatillos) ---
 
-        canvas { position: absolute; background: transparent; image-rendering: pixelated; }
-        #drawCanvas { background: white; z-index: 1; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
-        #steadyCanvas { pointer-events: none; z-index: 5; }
-        #previewCanvas { pointer-events: none; z-index: 10; }
+let smoothX = W/2;
+let smoothY = W/2;
+const SMOOTH_FACTOR = 0.15; // Entre 0 y 1 (menor = más suave/lento)
 
-        /* Cursor & UI Elements */
-        #cursor { position: absolute; width: 20px; height: 20px; border: 2px solid #ff4444; border-radius: 50%; pointer-events: none; z-index: 1000; transform: translate(-50%, -50%); display: none; }
-        #cursor.steady-mode { border-color: #44ff44; }
-        #cursor.radial-active { border-color: white; transform: translate(-50%, -50%) scale(1.5); border-style: dashed; }
+function updateGamepad() {
+    const gp = navigator.getGamepads()[0];
+    if (!gp) return;
 
-        /* Menú Radial */
-        #radial-menu {
-            position: absolute; width: 220px; height: 220px; pointer-events: none; display: none; z-index: 3000; transform: translate(-50%, -50%);
+    // 1. MODIFICADOR DE PRECISIÓN (Gatillo Izquierdo - LT)
+    // Si presionas LT, el cursor se mueve mucho más lento para detalles.
+    const precisionMode = gp.buttons[6].value > 0.1;
+    const speedMultiplier = precisionMode ? 2 : 10;
+
+    // 2. LECTURA DE STICKS CON DEADZONE
+    const rawLx = Math.abs(gp.axes[0]) > 0.1 ? gp.axes[0] : 0;
+    const rawLy = Math.abs(gp.axes[1]) > 0.1 ? gp.axes[1] : 0;
+    
+    // Compensación por rotación del canvas
+    const rad = -state.rotation * Math.PI / 180;
+    const targetX = rawLx * Math.cos(rad) - rawLy * Math.sin(rad);
+    const targetY = rawLx * Math.sin(rad) + rawLy * Math.cos(rad);
+
+    // 3. IMPLEMENTACIÓN DEL SMOOTHING (Interpolación Lineal)
+    // El cursor "persigue" al stick suavemente en lugar de saltar
+    state.x += targetX * speedMultiplier;
+    state.y += targetY * speedMultiplier;
+
+    // Límites del lienzo
+    state.x = Math.max(0, Math.min(W, state.x));
+    state.y = Math.max(0, Math.min(H, state.y));
+
+    // Suavizado visual del cursor
+    smoothX += (state.x - smoothX) * SMOOTH_FACTOR;
+    smoothY += (state.y - smoothY) * SMOOTH_FACTOR;
+
+    // 4. PRESIÓN ANALÓGICA (Gatillo Derecho - RT)
+    state.pressure = gp.buttons[7].value; // Valor entre 0.0 y 1.0
+
+    if (state.pressure > 0.05) {
+        if (!state.isDrawing) {
+            state.isDrawing = true;
+            state.lastX = smoothX;
+            state.lastY = smoothY;
+            saveHistory();
         }
-        .radial-item {
-            position: absolute; width: 55px; height: 55px; background: rgba(30, 30, 30, 0.95); border: 2px solid #444; border-radius: 50%;
-            color: white; display: flex; align-items: center; justify-content: center; font-size: 24px; transition: all 0.15s cubic-bezier(0.18, 0.89, 0.32, 1.28);
-            left: 50%; top: 50%; transform: translate(-50%, -50%);
-        }
-        .radial-item.highlight { background: #ff4444; border-color: white; transform: translate(-50%, -50%) scale(1.3); box-shadow: 0 0 15px rgba(255,68,68,0.5); }
-        
-        /* Posiciones del Menú Radial */
-        .radial-item[data-pos="N"] { transform: translate(-50%, calc(-50% - 80px)); }
-        .radial-item[data-pos="E"] { transform: translate(calc(-50% + 80px), -50%); }
-        .radial-item[data-pos="S"] { transform: translate(-50%, calc(-50% + 80px)); }
-        .radial-item[data-pos="W"] { transform: translate(calc(-50% - 80px), -50%); }
-
-        /* Toolbar minimalista */
-        #toolbar { height: 60px; background: #252525; display: flex; align-items: center; padding: 0 15px; gap: 15px; border-top: 1px solid #333; z-index: 4000; }
-        .tool-btn { padding: 8px 12px; background: #333; border: 1px solid #444; color: white; border-radius: 4px; font-size: 12px; }
-        .tool-btn.active { background: #ff4444; border-color: #ff6666; }
-
-        #hud { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.7); color: #0f0; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 10px; pointer-events: none; z-index: 5000; }
-    </style>
-</head>
-<body>
-
-<div id="container">
-    <div id="canvas-wrapper">
-        <canvas id="drawCanvas"></canvas>
-        <canvas id="steadyCanvas"></canvas>
-        <canvas id="previewCanvas"></canvas>
-        <div id="cursor"></div>
-        
-        <div id="radial-menu">
-            <div class="radial-item" data-pos="N" data-tool="brush">✏️</div>
-            <div class="radial-item" data-pos="E" data-tool="eraser">🧹</div>
-            <div class="radial-item" data-pos="S" data-tool="line">📏</div>
-            <div class="radial-item" data-pos="W" data-tool="spline">🌊</div>
-        </div>
-    </div>
-
-    <div id="toolbar">
-        <input type="color" id="colorPicker" value="#000000">
-        <input type="range" id="brushSize" min="1" max="60" value="5">
-        <button class="tool-btn" onclick="undo()">↶ Undo</button>
-        <button class="tool-btn" onclick="clearCanvas()">🗑️ Clear</button>
-        <div id="status-msg" style="color: #666; font-size: 10px; margin-left: auto;">M600 Ready | Press Y for Menu</div>
-    </div>
-</div>
-
-<div id="hud">
-    FPS: <span id="fps">60</span><br>
-    TOOL: <span id="hud-tool">brush</span><br>
-    POS: <span id="hud-pos">0,0</span>
-</div>
-
-<script>
-    const canvas = document.getElementById('drawCanvas');
-    const ctx = canvas.getContext('2d');
-    const steadyCanvas = document.getElementById('steadyCanvas');
-    const steadyCtx = steadyCanvas.getContext('2d');
-    const previewCanvas = document.getElementById('previewCanvas');
-    const previewCtx = previewCanvas.getContext('2d');
-    const cursorEl = document.getElementById('cursor');
-    const radialMenu = document.getElementById('radial-menu');
-
-    // Configuración inicial
-    const W = 1280, H = 720;
-    [canvas, steadyCanvas, previewCanvas].forEach(c => { c.width = W; c.height = H; });
-    ctx.fillStyle = 'white';
-    ctx.fillRect(0, 0, W, H);
-
-    let state = {
-        x: W/2, y: H/2, lastX: W/2, lastY: H/2,
-        isDrawing: false, tool: 'brush', color: '#000000', size: 5,
-        pressure: 0, radialOpen: false, radialSelection: null,
-        history: [], smoothing: 0.8,
-        gamepadActive: false
-    };
-
-    // --- LÓGICA DE GAMEPAD ---
-    window.addEventListener("gamepadconnected", () => { state.gamepadActive = true; cursorEl.style.display = 'block'; });
-
-    function updateGamepad() {
-        const gp = navigator.getGamepads()[0];
-        if (!gp) return;
-
-        // Movimiento Stick Izquierdo
-        const lx = Math.abs(gp.axes[0]) > 0.1 ? gp.axes[0] : 0;
-        const ly = Math.abs(gp.axes[1]) > 0.1 ? gp.axes[1] : 0;
-        state.x += lx * 10;
-        state.y += ly * 10;
-
-        // Límites
-        state.x = Math.max(0, Math.min(W, state.x));
-        state.y = Math.max(0, Math.min(H, state.y));
-
-        // Botón Y: Menú Radial
-        const btnY = gp.buttons[3].pressed;
-        if (btnY) {
-            if (!state.radialOpen) openRadial();
-            updateRadialSelection(gp.axes[2], gp.axes[3]); // Stick derecho para elegir
-        } else if (state.radialOpen) {
-            closeRadial();
-        }
-
-        // Gatillo RT: Dibujar + Presión
-        const rt = gp.buttons[7].value;
-        if (rt > 0.1 && !state.radialOpen) {
-            state.pressure = rt;
-            if (!state.isDrawing) startStroke();
-            drawStroke();
-        } else {
-            if (state.isDrawing) endStroke();
-        }
-
-        // Botón B: Undo
-        if (gp.buttons[1].pressed && !state.prevB) undo();
-        state.prevB = gp.buttons[1].pressed;
-
-        updateCursorUI();
+        drawSmoothStroke();
+    } else {
+        state.isDrawing = false;
     }
 
-    // --- MENÚ RADIAL ---
-    function openRadial() {
-        state.radialOpen = true;
-        radialMenu.style.display = 'block';
-        radialMenu.style.left = cursorEl.style.left;
-        radialMenu.style.top = cursorEl.style.top;
-        cursorEl.classList.add('radial-active');
-    }
+    updateCursorUI(smoothX, smoothY);
+}
 
-    function updateRadialSelection(rx, ry) {
-        const mag = Math.sqrt(rx*rx + ry*ry);
-        if (mag > 0.5) {
-            const angle = Math.atan2(ry, rx) * 180 / Math.PI;
-            let selection = "";
-            if (angle > -45 && angle <= 45) selection = "eraser";
-            else if (angle > 45 && angle <= 135) selection = "line";
-            else if (angle > -135 && angle <= -45) selection = "brush";
-            else selection = "spline";
+function drawSmoothStroke() {
+    ctx.beginPath();
+    ctx.strokeStyle = state.color;
+    // El grosor depende 100% de cuánto aprietas el gatillo RT
+    ctx.lineWidth = state.size * (0.1 + state.pressure * 0.9);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    
+    ctx.moveTo(state.lastX, state.lastY);
+    ctx.lineTo(smoothX, smoothY);
+    ctx.stroke();
 
-            state.radialSelection = selection;
-            document.querySelectorAll('.radial-item').forEach(el => {
-                el.classList.toggle('highlight', el.dataset.tool === selection);
-            });
-        }
-    }
-
-    function closeRadial() {
-        if (state.radialSelection) {
-            state.tool = state.radialSelection;
-            document.getElementById('hud-tool').innerText = state.tool;
-        }
-        state.radialOpen = false;
-        radialMenu.style.display = 'none';
-        cursorEl.classList.remove('radial-active');
-    }
-
-    // --- DIBUJO ---
-    function startStroke() {
-        state.isDrawing = true;
-        state.lastX = state.x;
-        state.lastY = state.y;
-        saveHistory();
-    }
-
-    function drawStroke() {
-        if (!state.isDrawing) return;
-        
-        ctx.beginPath();
-        ctx.strokeStyle = state.tool === 'eraser' ? 'white' : state.color;
-        ctx.lineWidth = state.size * (0.2 + state.pressure * 0.8);
-        ctx.lineCap = 'round';
-        ctx.moveTo(state.lastX, state.lastY);
-        ctx.lineTo(state.x, state.y);
-        ctx.stroke();
-
-        state.lastX = state.x;
-        state.lastY = state.y;
-    }
-
-    function endStroke() { state.isDrawing = false; }
-
-    // --- EVENTOS TOUCH (Para la pantalla de la M600) ---
-    canvas.addEventListener('touchstart', e => {
-        const t = e.touches[0];
-        setPosFromEvent(t);
-        state.pressure = 0.8; // Touch emula presión constante
-        startStroke();
-    });
-    canvas.addEventListener('touchmove', e => {
-        setPosFromEvent(e.touches[0]);
-        drawStroke();
-    });
-    canvas.addEventListener('touchend', endStroke);
-
-    function setPosFromEvent(e) {
-        const rect = canvas.getBoundingClientRect();
-        state.x = (e.clientX - rect.left) * (W / rect.width);
-        state.y = (e.clientY - rect.top) * (H / rect.height);
-        updateCursorUI();
-    }
-
-    function updateCursorUI() {
-        const rect = canvas.getBoundingClientRect();
-        const scale = rect.width / W;
-        cursorEl.style.left = (rect.left + state.x * scale) + 'px';
-        cursorEl.style.top = (rect.top + state.y * scale) + 'px';
-        document.getElementById('hud-pos').innerText = `${Math.round(state.x)},${Math.round(state.y)}`;
-    }
-
-    // --- UTILIDADES ---
-    function undo() {
-        if (state.history.length > 0) {
-            ctx.putImageData(state.history.pop(), 0, 0);
-        }
-    }
-    function saveHistory() {
-        if (state.history.length > 20) state.history.shift();
-        state.history.push(ctx.getImageData(0, 0, W, H));
-    }
-    function clearCanvas() { ctx.fillRect(0, 0, W, H); state.history = []; }
-
-    document.getElementById('colorPicker').onchange = e => state.color = e.target.value;
-    document.getElementById('brushSize').oninput = e => state.size = e.target.value;
-
-    function loop() {
-        if (state.gamepadActive) updateGamepad();
-        requestAnimationFrame(loop);
-    }
-    loop();
-</script>
-</body>
-</html>
+    state.lastX = smoothX;
+    state.lastY = smoothY;
+}
